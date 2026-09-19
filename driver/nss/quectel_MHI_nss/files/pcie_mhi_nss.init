@@ -83,53 +83,6 @@ wait_for_p5_modem() {
 	return 1
 }
 
-wait_for_p5_pci_modem() {
-	local retries="$1"
-
-	while [ "$retries" -gt 0 ]; do
-		[ -n "$(find_p5_pci_modem)" ] && return 0
-		sleep 1
-		retries=$((retries - 1))
-	done
-
-	return 1
-}
-
-cycle_p5_slot_power() {
-	local device driver=/sys/bus/platform/drivers/pci-pwrctrl-slot slot
-
-	[ -w "$driver/unbind" ] && [ -w "$driver/bind" ] || {
-		logger -t pcie_mhi_nss "cannot power cycle modem because pci-pwrctrl-slot controls are unavailable"
-		return 1
-	}
-
-	for device in "$driver"/*:*; do
-		[ -L "$device" ] || continue
-		slot=${device##*/}
-		break
-	done
-
-	[ -n "$slot" ] || {
-		logger -t pcie_mhi_nss "cannot power cycle modem because no bound PCI slot power device was found"
-		return 1
-	}
-
-	logger -t pcie_mhi_nss "GPIO30 recovery failed; releasing PCI slot power to switch GPIO35 off"
-	echo "$slot" > "$driver/unbind" || {
-		logger -t pcie_mhi_nss "failed to release PCI slot power device $slot"
-		return 1
-	}
-	logger -t pcie_mhi_nss "modem power is off; waiting 2 seconds"
-	sleep 2
-	logger -t pcie_mhi_nss "reacquiring PCI slot power to switch GPIO35 on and rescan PCIe"
-	echo "$slot" > "$driver/bind" || {
-		logger -t pcie_mhi_nss "failed to reacquire PCI slot power device $slot"
-		return 1
-	}
-
-	return 0
-}
-
 wait_for_p5_wifi() {
 	local retries=120
 
@@ -195,37 +148,7 @@ start_p5_modem() {
 		return 0
 	fi
 
-	logger -t pcie_mhi_nss "GPIO30 recovery failed; modem may require a complete PCI slot power cycle"
-
-	if grep -q '^pcie_mhi ' /proc/modules; then
-		logger -t pcie_mhi_nss "unloading MHI before PCI slot power recovery"
-		rmmod pcie_mhi || {
-			logger -t pcie_mhi_nss "failed to unload MHI before PCI slot power recovery"
-			return 1
-		}
-	fi
-
-	pci_device=$(find_p5_pci_modem)
-	if [ -n "$pci_device" ] && [ -w "$pci_device/remove" ]; then
-		logger -t pcie_mhi_nss "removing stale PCIe modem at ${pci_device##*/} before slot power recovery"
-		echo 1 > "$pci_device/remove"
-	fi
-
-	cycle_p5_slot_power || return 1
-	logger -t pcie_mhi_nss "PCI slot power is on; waiting for automatic PCIe rescan"
-	if ! wait_for_p5_pci_modem 30; then
-		logger -t pcie_mhi_nss "PCI slot power recovery failed; modem endpoint did not enumerate"
-		return 1
-	fi
-
-	logger -t pcie_mhi_nss "modem endpoint enumerated after slot power recovery; loading MHI"
-	if load_mhi && wait_for_p5_modem 40; then
-		pci_device=$(find_p5_pci_modem)
-		logger -t pcie_mhi_nss "PCI slot power recovery succeeded; modem is ready at ${pci_device##*/}"
-		return 0
-	fi
-
-	logger -t pcie_mhi_nss "PCI slot power recovery failed; MHI did not become ready"
+	logger -t pcie_mhi_nss "GPIO30 recovery failed; leaving PCI slot power and root port unchanged"
 	return 1
 }
 
