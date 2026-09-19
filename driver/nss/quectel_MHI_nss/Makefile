@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=pcie_mhi_nss
 PKG_VERSION:=1.3.8
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 include $(INCLUDE_DIR)/kernel.mk
 include $(INCLUDE_DIR)/package.mk
@@ -16,7 +16,6 @@ define KernelPackage/pcie_mhi_nss
 	    @PCI_SUPPORT \
 	    +kmod-rmnet-nss
   FILES:=$(PKG_BUILD_DIR)/pcie_mhi.ko
-  AUTOLOAD:=$(call AutoLoad,90,pcie_mhi)
 endef
 
 define KernelPackage/pcie_mhi_nss/description
@@ -36,6 +35,11 @@ endif
 define Build/Compile
 	+$(KERNEL_MAKE) ccflags-y="$(EXTRA_CFLAGS)" M="$(PKG_BUILD_DIR)" \
 		modules
+endef
+
+define KernelPackage/pcie_mhi_nss/install
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/pcie_mhi_nss.init $(1)/etc/init.d/pcie_mhi_nss
 endef
 
 $(eval $(call KernelPackage,pcie_mhi_nss))

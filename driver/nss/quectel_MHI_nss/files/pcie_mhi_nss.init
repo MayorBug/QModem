@@ -1,0 +1,261 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+
+configure_p5_modem() {
+	local at_port response verify retries=10
+
+	command -v tom_modem >/dev/null 2>&1 || {
+		logger -t pcie_mhi_nss "tom_modem is unavailable; skipping PCIe mode setup"
+		return 1
+	}
+
+	while [ "$retries" -gt 0 ]; do
+		for at_port in /dev/mhi_DUN /dev/ttyUSB2 /dev/ttyUSB3 /dev/ttyUSB1 /dev/ttyUSB0; do
+			[ -c "$at_port" ] || continue
+			response=$(tom_modem -d "$at_port" -o a \
+				-c 'AT+QCFG="data_interface"' -t 2 2>/dev/null)
+			case "$response" in
+				*'"data_interface",1,0'*)
+					logger -t pcie_mhi_nss "modem PCIe data interface already enabled on $at_port"
+					return 0
+					;;
+				*'+QCFG:'*)
+					response=$(tom_modem -d "$at_port" -o a \
+						-c 'AT+QCFG="data_interface",1,0' -t 2 2>/dev/null)
+					case "$response" in
+						*OK*)
+							sleep 1
+							verify=$(tom_modem -d "$at_port" -o a \
+								-c 'AT+QCFG="data_interface"' -t 2 2>/dev/null)
+							case "$verify" in
+								*'"data_interface",1,0'*)
+									logger -t pcie_mhi_nss "enabled and verified modem PCIe data interface on $at_port"
+									;;
+								*)
+									logger -t pcie_mhi_nss "modem accepted PCIe data interface setting on $at_port; verification requires a restart"
+									;;
+							esac
+							return 0
+							;;
+					esac
+					;;
+			esac
+		done
+		sleep 1
+		retries=$((retries - 1))
+	done
+
+	logger -t pcie_mhi_nss "could not configure modem PCIe data interface"
+	return 1
+}
+
+find_p5_pci_modem() {
+	local device device_id vendor
+
+	for device in /sys/bus/pci/devices/*; do
+		[ -r "$device/vendor" ] || continue
+		[ -r "$device/device" ] || continue
+		vendor=$(cat "$device/vendor")
+		device_id=$(cat "$device/device")
+		[ "$vendor" = "0x17cb" ] || continue
+		case "$device_id" in
+			0x011a|0x0306|0x0308|0x0309)
+				echo "$device"
+				return 0
+				;;
+		esac
+	done
+
+	return 1
+}
+
+wait_for_p5_modem() {
+	local pci_device retries="$1"
+
+	while [ "$retries" -gt 0 ]; do
+		pci_device=$(find_p5_pci_modem)
+		[ -n "$pci_device" ] && [ -c /dev/mhi_QMI0 ] && return 0
+		sleep 1
+		retries=$((retries - 1))
+	done
+
+	return 1
+}
+
+wait_for_p5_pci_modem() {
+	local retries="$1"
+
+	while [ "$retries" -gt 0 ]; do
+		[ -n "$(find_p5_pci_modem)" ] && return 0
+		sleep 1
+		retries=$((retries - 1))
+	done
+
+	return 1
+}
+
+cycle_p5_slot_power() {
+	local device driver=/sys/bus/platform/drivers/pci-pwrctrl-slot slot
+
+	[ -w "$driver/unbind" ] && [ -w "$driver/bind" ] || {
+		logger -t pcie_mhi_nss "cannot power cycle modem because pci-pwrctrl-slot controls are unavailable"
+		return 1
+	}
+
+	for device in "$driver"/*:*; do
+		[ -L "$device" ] || continue
+		slot=${device##*/}
+		break
+	done
+
+	[ -n "$slot" ] || {
+		logger -t pcie_mhi_nss "cannot power cycle modem because no bound PCI slot power device was found"
+		return 1
+	}
+
+	logger -t pcie_mhi_nss "GPIO30 recovery failed; releasing PCI slot power to switch GPIO35 off"
+	echo "$slot" > "$driver/unbind" || {
+		logger -t pcie_mhi_nss "failed to release PCI slot power device $slot"
+		return 1
+	}
+	logger -t pcie_mhi_nss "modem power is off; waiting 2 seconds"
+	sleep 2
+	logger -t pcie_mhi_nss "reacquiring PCI slot power to switch GPIO35 on and rescan PCIe"
+	echo "$slot" > "$driver/bind" || {
+		logger -t pcie_mhi_nss "failed to reacquire PCI slot power device $slot"
+		return 1
+	}
+
+	return 0
+}
+
+wait_for_p5_wifi() {
+	local retries=120
+
+	while [ "$retries" -gt 0 ]; do
+		[ -d /sys/class/ieee80211/phy0 ] && \
+			[ -d /sys/class/ieee80211/phy1 ] && return 0
+		sleep 1
+		retries=$((retries - 1))
+	done
+
+	logger -t pcie_mhi_nss "Wi-Fi PHYs did not become ready; refusing to load MHI"
+	return 1
+}
+
+start_p5_modem() {
+	local pci_device
+	local reset_gpio=/sys/class/gpio/modem-reset/value
+
+	pci_device=$(find_p5_pci_modem)
+	if [ -n "$pci_device" ]; then
+		logger -t pcie_mhi_nss "PCIe modem found at ${pci_device##*/}; trying MHI without restarting the modem"
+		if load_mhi && wait_for_p5_modem 20; then
+			logger -t pcie_mhi_nss "PCIe modem became ready without recovery"
+			return 0
+		fi
+		logger -t pcie_mhi_nss "PCIe endpoint is present but MHI did not become ready; starting GPIO30 reset recovery"
+	else
+		logger -t pcie_mhi_nss "PCIe modem endpoint is missing; starting GPIO30 reset recovery"
+	fi
+
+	if grep -q '^pcie_mhi ' /proc/modules; then
+		logger -t pcie_mhi_nss "unloading MHI before GPIO30 reset recovery"
+		rmmod pcie_mhi || {
+			logger -t pcie_mhi_nss "failed to unload MHI"
+			return 1
+		}
+	fi
+
+	pci_device=$(find_p5_pci_modem)
+	if [ -n "$pci_device" ] && [ -w "$pci_device/remove" ]; then
+		logger -t pcie_mhi_nss "removing stale PCIe modem at ${pci_device##*/} before reset"
+		echo 1 > "$pci_device/remove"
+	fi
+
+	if [ ! -w "$reset_gpio" ]; then
+		logger -t pcie_mhi_nss "cannot attempt normal recovery because modem reset GPIO30 is unavailable"
+		return 1
+	fi
+
+	logger -t pcie_mhi_nss "restarting modem with GPIO30 because its PCIe data path is not ready"
+	echo 1 > "$reset_gpio"
+	sleep 1
+	echo 0 > "$reset_gpio"
+	logger -t pcie_mhi_nss "GPIO30 reset released; waiting 25 seconds for modem stabilization"
+	sleep 25
+	logger -t pcie_mhi_nss "rescanning PCIe after GPIO30 reset"
+	echo 1 > /sys/bus/pci/rescan
+
+	logger -t pcie_mhi_nss "loading MHI after GPIO30 modem stabilization"
+	if load_mhi && wait_for_p5_modem 40; then
+		pci_device=$(find_p5_pci_modem)
+		logger -t pcie_mhi_nss "GPIO30 recovery succeeded; PCIe modem is ready at ${pci_device##*/}"
+		return 0
+	fi
+
+	logger -t pcie_mhi_nss "GPIO30 recovery failed; modem may require a complete PCI slot power cycle"
+
+	if grep -q '^pcie_mhi ' /proc/modules; then
+		logger -t pcie_mhi_nss "unloading MHI before PCI slot power recovery"
+		rmmod pcie_mhi || {
+			logger -t pcie_mhi_nss "failed to unload MHI before PCI slot power recovery"
+			return 1
+		}
+	fi
+
+	pci_device=$(find_p5_pci_modem)
+	if [ -n "$pci_device" ] && [ -w "$pci_device/remove" ]; then
+		logger -t pcie_mhi_nss "removing stale PCIe modem at ${pci_device##*/} before slot power recovery"
+		echo 1 > "$pci_device/remove"
+	fi
+
+	cycle_p5_slot_power || return 1
+	logger -t pcie_mhi_nss "PCI slot power is on; waiting for automatic PCIe rescan"
+	if ! wait_for_p5_pci_modem 30; then
+		logger -t pcie_mhi_nss "PCI slot power recovery failed; modem endpoint did not enumerate"
+		return 1
+	fi
+
+	logger -t pcie_mhi_nss "modem endpoint enumerated after slot power recovery; loading MHI"
+	if load_mhi && wait_for_p5_modem 40; then
+		pci_device=$(find_p5_pci_modem)
+		logger -t pcie_mhi_nss "PCI slot power recovery succeeded; modem is ready at ${pci_device##*/}"
+		return 0
+	fi
+
+	logger -t pcie_mhi_nss "PCI slot power recovery failed; MHI did not become ready"
+	return 1
+}
+
+load_mhi() {
+	grep -q '^pcie_mhi ' /proc/modules && return 0
+
+	modprobe pcie_mhi
+}
+
+start() {
+	. /lib/functions.sh
+
+	if [ "$(board_name)" != "cudy,p5" ]; then
+		load_mhi
+		return
+	fi
+
+	(
+		lock_dir=/var/run/pcie_mhi_nss.lock
+		mkdir "$lock_dir" 2>/dev/null || {
+			logger -t pcie_mhi_nss "startup is already in progress"
+			exit 0
+		}
+		trap 'rmdir "$lock_dir"' 0 1 2 15
+
+		wait_for_p5_wifi || exit 1
+		logger -t pcie_mhi_nss "Wi-Fi ready; preparing PCIe modem"
+		start_p5_modem || exit 1
+		configure_p5_modem
+		logger -t pcie_mhi_nss "PCIe modem is ready"
+		ubus call qmodem scan_pcie >/dev/null 2>&1 || true
+	) &
+}
