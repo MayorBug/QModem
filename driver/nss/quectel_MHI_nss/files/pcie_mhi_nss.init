@@ -179,6 +179,7 @@ start() {
 		start_p5_modem || exit 1
 		configure_p5_modem
 		logger -t pcie_mhi_nss "PCIe modem is ready"
+		ubus call wwand hotplug '{"action":"add","device":"mhi_QMI0"}' >/dev/null 2>&1 || true
 		ubus call qmodem scan_pcie >/dev/null 2>&1 || true
 	) &
 }
